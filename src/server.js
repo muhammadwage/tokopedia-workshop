@@ -1,29 +1,16 @@
 import 'isomorphic-unfetch';
-import App from './App';
+import path from 'path';
 import React from 'react';
 import { StaticRouter } from 'react-router-dom';
 import { renderToString } from 'react-dom/server';
+import { ChunkExtractor, ChunkExtractorManager } from '@loadable/server';
+// Read the doc on https://github.com/staylor/react-helmet-async
+import { HelmetProvider } from 'react-helmet-async';
 import express from 'express';
 import { ApolloClient, ApolloProvider, createHttpLink, InMemoryCache } from '@apollo/client';
 import { getDataFromTree } from '@apollo/client/react/ssr';
 
-const razzleAssets = require(process.env.RAZZLE_ASSETS_MANIFEST);
-
-const cssLinksFromAssets = (assets, entrypoint) => {
-  return assets[entrypoint]
-    ? assets[entrypoint].css
-      ? assets[entrypoint].css.map((asset) => <link rel="stylesheet" href={asset} />)
-      : ''
-    : '';
-};
-
-const jsScriptTagsFromAssets = (assets, entrypoint) => {
-  return assets[entrypoint]
-    ? assets[entrypoint].js
-      ? assets[entrypoint].js.map((asset) => <script src={`${asset}`} defer crossOrigin />)
-      : ''
-    : '';
-};
+import App from './App';
 
 const server = express();
 
@@ -31,6 +18,12 @@ server
   .disable('x-powered-by')
   .use(express.static(process.env.RAZZLE_PUBLIC_DIR))
   .get('/*', (req, res) => {
+    const extractor = new ChunkExtractor({
+      statsFile: path.resolve('build/loadable-stats.json'),
+      // razzle client bundle entrypoint is client.js
+      entrypoints: ['client'],
+    });
+
     const apolloClient = new ApolloClient({
       ssrMode: true,
       cache: new InMemoryCache(),
@@ -39,14 +32,22 @@ server
       }),
     });
 
+    const helmetContext = {};
     const context = {};
     const markup = (
-      <ApolloProvider client={apolloClient}>
-        <StaticRouter context={context} location={req.url}>
-          <App />
-        </StaticRouter>
-      </ApolloProvider>
+      <ChunkExtractorManager extractor={extractor}>
+        <HelmetProvider context={helmetContext}>
+          <ApolloProvider client={apolloClient}>
+            <StaticRouter context={context} location={req.url}>
+              <App />
+            </StaticRouter>
+          </ApolloProvider>
+        </HelmetProvider>
+      </ChunkExtractorManager>
     );
+
+    // ${preloadAssets(razzleAssets, 'client')}
+    // ${cssLinksFromAssets(razzleAssets, 'client')}
 
     if (context.url) {
       res.redirect(context.url);
@@ -54,26 +55,40 @@ server
       getDataFromTree(markup).then((content) => {
         const initialState = apolloClient.extract();
 
-        const html = renderToString(
-          <html lang="en">
+        const { helmet } = helmetContext;
+
+        const appBody = renderToString(<div id="root" dangerouslySetInnerHTML={{ __html: content }} />);
+
+        const scriptTags = extractor.getScriptTags();
+        // collect "preload/prefetch" links
+        const linkTags = extractor.getLinkTags();
+        // collect style tags
+        const styleTags = extractor.getStyleTags();
+
+        const html = `
+						<html lang="en" ${helmet.htmlAttributes.toString()}>
             <head>
               <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
-              <meta charset="utf-8" />
-              <title>Welcome to Razzle</title>
               <meta name="viewport" content="width=device-width, initial-scale=1" />
-              {cssLinksFromAssets(razzleAssets, 'client')}
-            </head>
-            <body>
-              <div id="root" dangerouslySetInnerHTML={{ __html: content }} />
-              <script
-                dangerouslySetInnerHTML={{
-                  __html: `window.__APOLLO_STATE__=${JSON.stringify(initialState).replace(/</g, '\\u003c')};`,
-                }}
-              />
-              {jsScriptTagsFromAssets(razzleAssets, 'client')}
-            </body>
-          </html>,
-        );
+              <meta charSet="utf-8" />
+
+							<link rel="preconnect" href="https://images.tokopedia.net" />
+							<link rel="dns-prefetch" href="https://images.tokopedia.net" />
+
+							${helmet.title.toString()}
+							${helmet.meta.toString()}
+							${helmet.link.toString()}
+
+							${linkTags}
+							${styleTags}
+					 	</head>
+						<body>
+							${appBody}
+							${scriptTags}
+							<script>window.__APOLLO_STATE__=${JSON.stringify(initialState).replace(/</g, '\\u003c')};</script>
+						</body>
+					</html>
+				`;
 
         res.status(200).header('Content-Type', 'text/html').send(`<!doctype html>\n${html}`);
       });
